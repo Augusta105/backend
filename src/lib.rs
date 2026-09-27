@@ -24,6 +24,7 @@ pub mod indexer;
 pub mod keeper;
 pub mod models;
 pub mod payoff;
+pub mod portfolio;
 pub mod positions;
 pub mod prices;
 pub mod rate_limit_key;
@@ -669,6 +670,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/strategies", get(strategies::list_strategies))
         .route("/api/v1/strategies/:id", get(strategies::get_strategy))
         .route("/api/v1/ws/spot", get(prices::ws_spot))
+        .route("/api/v1/portfolio", get(portfolio::get_portfolio_handler))
         .route("/api/v1/portfolio/payoff", post(payoff::post_payoff))
         .route(
             "/api/v1/portfolio/greeks",
