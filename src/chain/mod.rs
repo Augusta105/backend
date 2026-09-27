@@ -3,6 +3,7 @@ pub mod horizon;
 pub mod readiness;
 pub mod relayer;
 pub mod rpc;
+pub mod simulate;
 pub mod submit;
 pub mod tx_builder;
 
@@ -10,5 +11,6 @@ pub use horizon::{AccountResponse, BalanceLine, HorizonClient, HorizonError};
 pub use readiness::{check_wallet_readiness, ReadinessItem, ReadinessReport};
 pub use relayer::{FeeBumpRelayer, RelayerError, SponsorshipPolicy};
 pub use rpc::{LedgerEntryInfo, SorobanRpcClient};
+pub use simulate::{SimulateAuthResult, SorobanAuthorizationEntry, TransactionSimulator};
 pub use submit::{SubmitError, TxSubmitter};
 pub use tx_builder::{TxBuilder, TxBuilderError};
