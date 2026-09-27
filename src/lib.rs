@@ -14,16 +14,20 @@ use tower_http::trace::TraceLayer;
 
 pub mod alerts;
 pub mod auth;
+pub mod chain;
 pub mod collateral;
+pub mod config;
 pub mod db;
 pub mod error;
 pub mod history;
+pub mod indexer;
 pub mod models;
 pub mod payoff;
 pub mod positions;
 pub mod prices;
 pub mod rate_limit_key;
 pub mod request_id;
+pub mod signing;
 pub mod strategies;
 pub mod strkey;
 pub mod watchlist;
@@ -231,6 +235,7 @@ pub struct AppState {
     pub spot_prices: Arc<std::sync::Mutex<std::collections::HashMap<String, f64>>>,
     pub vol_surface: Arc<std::sync::Mutex<std::collections::HashMap<String, f64>>>,
     pub db: sqlx::SqlitePool,
+    pub network: Arc<config::NetworkConfig>,
     /// Broadcasts a JSON-encoded SpotResponse every time the price
     /// simulator nudges spot_prices, for the /api/v1/ws/spot handler to
     /// forward to connected clients. `send` errors (no receivers) are
@@ -241,6 +246,10 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(db: sqlx::SqlitePool) -> Self {
+        Self::new_with_network(db, Arc::new(config::NetworkConfig::testnet()))
+    }
+
+    pub fn new_with_network(db: sqlx::SqlitePool, network: Arc<config::NetworkConfig>) -> Self {
         let mut prices = std::collections::HashMap::new();
         prices.insert("XLM".into(), 0.1182);
         prices.insert("BTC".into(), 67420.50);
@@ -259,6 +268,7 @@ impl AppState {
             spot_prices: Arc::new(std::sync::Mutex::new(prices)),
             vol_surface: Arc::new(std::sync::Mutex::new(vols)),
             db,
+            network,
             spot_tx,
         }
     }
@@ -344,7 +354,7 @@ async fn health(State(state): State<AppState>) -> Result<Json<serde_json::Value>
         "status": "ok",
         "service": "zenith-backend",
         "version": "0.1.0",
-        "network": "stellar-testnet",
+        "network": state.network.name,
         "database": "ok"
     })))
 }
@@ -496,7 +506,7 @@ async fn get_protocol_stats(State(state): State<AppState>) -> Json<serde_json::V
         "open_interest": 1_420_000.0,
         "unique_traders": 312,
         "markets": prices.keys().collect::<Vec<_>>(),
-        "network": "stellar-testnet"
+        "network": state.network.name
     }))
 }
 
@@ -520,11 +530,19 @@ pub fn init_tracing() {
 /// simulator) against it.
 pub async fn init_state() -> AppState {
     dotenvy::dotenv().ok();
+    let network_config = config::NetworkConfig::load_from_env()
+        .expect("failed to load and validate network configuration");
+
     let database_url =
         std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://zenith.db".to_string());
     let pool = db::init_pool(&database_url).await;
 
-    let state = AppState::new(pool);
+    network_config
+        .validate_startup(&pool)
+        .await
+        .expect("network validation failed at startup");
+
+    let state = AppState::new_with_network(pool, Arc::new(network_config));
     tokio::spawn(auth::cleanup_expired_loop(state.db.clone()));
     tokio::spawn(alerts::check_alerts_loop(state.clone()));
     tokio::spawn(prices::price_simulator_loop(state.clone()));
@@ -625,6 +643,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/chain", get(get_chain))
         .route("/api/v1/expiries/:underlying", get(get_expiry_calendar))
         .route("/api/v1/stats", get(get_protocol_stats))
+        .route("/api/v1/wallet/readiness", get(chain::readiness::get_readiness_handler))
         .merge(auth_rate_limited_routes())
         .merge(mutation_rate_limited_routes())
         .route("/api/v1/auth/me", get(auth::get_me))
