@@ -116,7 +116,7 @@ pub struct NetworkConfig {
     pub allow_mainnet: bool,
 }
 
-#[derive(Debug, thiserror_no_std::Error, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum NetworkConfigError {
     InvalidNetworkType(String),
     MainnetDisallowed,
@@ -126,11 +126,6 @@ pub enum NetworkConfigError {
     ContractNotFound(String),
     InvalidContractId(String),
     DatabaseError(String),
-}
-
-// Custom simple Error implementation since thiserror is not in Cargo.toml
-mod thiserror_no_std {
-    pub use std::error::Error;
 }
 
 impl fmt::Display for NetworkConfigError {

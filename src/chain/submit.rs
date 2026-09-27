@@ -1,5 +1,3 @@
-use super::relayer::RelayerError;
-
 #[derive(Debug)]
 pub enum SubmitError {
     RpcError(String),

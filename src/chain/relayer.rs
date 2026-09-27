@@ -25,7 +25,7 @@ impl Default for SponsorshipPolicy {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub enum RelayerError {
     UnauthorizedTransaction,
     FeeExceedsMax(i64, i64),

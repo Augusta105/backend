@@ -1,3 +1,4 @@
+pub mod bindings;
 pub mod horizon;
 pub mod readiness;
 pub mod relayer;
