@@ -28,6 +28,7 @@ pub mod portfolio;
 pub mod positions;
 pub mod prices;
 pub mod rate_limit_key;
+pub mod repo;
 pub mod request_id;
 pub mod sep10;
 pub mod sep45;
