@@ -28,6 +28,7 @@ pub mod positions;
 pub mod prices;
 pub mod rate_limit_key;
 pub mod request_id;
+pub mod sep10;
 pub mod signing;
 pub mod strategies;
 pub mod strkey;
@@ -638,6 +639,8 @@ pub fn build_router(state: AppState) -> Router {
 
     Router::new()
         .route("/health", get(health))
+        .route("/.well-known/stellar.toml", get(sep10::get_stellar_toml))
+        .route("/auth", get(sep10::get_sep10_challenge))
         .route("/api/v1/spot", get(get_spot))
         .route("/api/v1/price", get(price_option))
         .route("/api/v1/iv", get(get_implied_vol))
