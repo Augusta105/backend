@@ -21,6 +21,7 @@ pub mod db;
 pub mod error;
 pub mod history;
 pub mod indexer;
+pub mod keeper;
 pub mod models;
 pub mod payoff;
 pub mod positions;
