@@ -431,3 +431,6 @@ mod tests {
         assert!(matches!(err, DecodeError::Malformed { .. }));
     }
 }
+
+    }
+}
