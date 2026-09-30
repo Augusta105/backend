@@ -1,13 +1,42 @@
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
-use axum::response::Response;
+use axum::extract::{ConnectInfo, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use rand::Rng;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::{broadcast, Mutex};
 
 use crate::AppState;
 
 const MAX_PCT_MOVE_PER_TICK: f64 = 0.003; // +/-0.3%
+
+/// Maximum number of channel subscriptions a single v2 connection may hold.
+const MAX_SUBSCRIPTIONS_PER_CONNECTION: usize = 50;
+
+/// How long a v2 connection may sit without sending a subscribe before the
+/// server closes it. Prevents idle sockets from pinning resources.
+const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Heartbeat cadence: ping every 20s, and require a pong within 10s.
+const PING_INTERVAL: Duration = Duration::from_secs(20);
+const PONG_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A client that stays behind the outbound buffer for longer than this is
+/// disconnected with close code 1008 (policy violation).
+const MAX_LAG_DURATION: Duration = Duration::from_secs(30);
+
+/// Default per-IP concurrent connection cap.
+const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 10;
+/// Default global concurrent connection cap.
+const DEFAULT_MAX_CONNECTIONS_GLOBAL: usize = 10_000;
+
+/// RFC 6455 close code for a policy violation (slow consumer).
+const CLOSE_POLICY_VIOLATION: u16 = 1008;
+/// RFC 6455 close code for going away (graceful shutdown).
+const CLOSE_GOING_AWAY: u16 = 1001;
 
 /// A single observed price for one underlying, tagged with where it came
 /// from and when it was observed. `observed_at` is a UTC timestamp.
@@ -159,433 +188,165 @@ impl HttpTickerSource {
     }
 }
 
-#[async_trait::async_trait]
-impl PriceSource for HttpTickerSource {
-    async fn fetch(
-        &self,
-        symbols: &[String],
-    ) -> Result<HashMap<String, PriceTick>, PriceError> {
-        let url = format!("{}/ticker/price", self.base_url.trim_end_matches('/'));
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    PriceError::Timeout
-                } else {
-                    PriceError::Upstream(e.to_string())
-                }
-            })?;
-
-        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err(PriceError::RateLimited);
-        }
-        if !resp.status().is_success() {
-            return Err(PriceError::Upstream(format!("HTTP {}", resp.status())));
-        }
-
-        let body: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| PriceError::Malformed(e.to_string()))?;
-
-        let now = chrono::Utc::now();
-        let mut ticks = HashMap::new();
-        // Binance returns a single object for one symbol and an array for
-        // many; accept both shapes and skip symbols the upstream omitted.
-        let entries: Vec<&serde_json::Value> = match &body {
-            serde_json::Value::Array(items) => items.iter().collect(),
-            serde_json::Value::Object(_) => vec![&body],
-            _ => return Err(PriceError::Malformed("unexpected JSON shape".into())),
-        };
-        for entry in entries {
-            let symbol = match entry.get("symbol").and_then(|s| s.as_str()) {
-                Some(s) => s.to_string(),
-                None => continue,
-            };
-            if !symbols.iter().any(|s| s == &symbol) {
-                continue;
-            }
-            let price = match entry
-                .get("price")
-                .and_then(|p| p.as_str())
-                .and_then(|p| p.parse::<f64>().ok())
-            {
-                Some(p) => p,
-                None => continue,
-            };
-            ticks.insert(
-                symbol,
-                PriceTick {
-                    price,
-                    source: self.name().to_string(),
-                    observed_at: now,
-                },
-            );
-        }
-        Ok(ticks)
-    }
-
-    fn name(&self) -> &str {
-        "http"
-    }
+/// Build the JSON error body used for rejected upgrades, matching the shape
+/// used elsewhere in the API.
+fn rejection_response(status: StatusCode, message: &str) -> Response {
+    let body = serde_json::json!({ "error": message }).to_string();
+    (status, [("content-type", "application/json")], body).into_response()
 }
 
-/// HTTP spot feed (e.g. CoinGecko / Binance public ticker). Uses `reqwest`
-/// with rustls and a hard 5s timeout on every fetch.
-pub struct HttpTickerSource {
-    client: reqwest::Client,
-    base_url: String,
-}
-
-    }
-
-    fn name(&self) -> &str {
-        "http"
-    }
-}
-
-/// Stellar Reflector oracle source. Reads `lastprice` through the Soroban
-/// RPC `simulateTransaction` read path. Reflector returns fixed-point
-/// integers alongside a `decimals()` value, so the raw value is scaled
-/// down by `10^decimals` before being emitted.
-pub struct ReflectorOracleSource {
-    client: reqwest::Client,
-    rpc_url: String,
-    contract_id: String,
-}
-
-impl ReflectorOracleSource {
-    pub fn new(rpc_url: impl Into<String>, contract_id: impl Into<String>) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .expect("failed to build HTTP client");
-        Self {
-            client,
-            rpc_url: rpc_url.into(),
-            contract_id: contract_id.into(),
-        }
-    }
-
-    /// Decode a Reflector fixed-point integer into a float price.
-    pub fn decode_fixed_point(raw: i128, decimals: u32) -> f64 {
-        raw as f64 / 10f64.powi(decimals as i32)
-    }
-}
-
-#[async_trait::async_trait]
-impl PriceSource for ReflectorOracleSource {
-    async fn fetch(
-        &self,
-        symbols: &[String],
-    ) -> Result<HashMap<String, PriceTick>, PriceError> {
-        let now = chrono::Utc::now();
-        let mut ticks = HashMap::new();
-        for symbol in symbols {
-            let request = serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "simulateTransaction",
-                "params": {
-                    "transaction": {
-                        "contract": self.contract_id,
-                        "method": "lastprice",
-                        "args": [symbol],
-                    }
-                }
-            });
-            let resp = self
-                .client
-                .post(&self.rpc_url)
-                .json(&request)
-                .send()
-                .await
-                .map_err(|e| {
-                    if e.is_timeout() {
-                        PriceError::Timeout
-                    } else {
-                        PriceError::Upstream(e.to_string())
-                    }
-                })?;
-            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                return Err(PriceError::RateLimited);
-            }
-            if !resp.status().is_success() {
-                return Err(PriceError::Upstream(format!("HTTP {}", resp.status())));
-            }
-            let body: serde_json::Value = resp
-                .json()
-                .await
-                .map_err(|e| PriceError::Malformed(e.to_string()))?;
-            // Reflector returns the fixed-point value as a string in the
-            // simulation result; skip symbols the oracle did not price.
-            let raw = body
-                .get("result")
-                .and_then(|r| r.get("returnValue"))
-                .and_then(|v| v.as_str())
-                .and_then(|v| v.parse::<i128>().ok());
-            let raw = match raw {
-                Some(v) => v,
-                None => continue,
-            };
-            let decimals = body
-                .get("result")
-                .and_then(|r| r.get("decimals"))
-                .and_then(|d| d.as_u64())
-                .unwrap_or(7) as u32;
-            ticks.insert(
-                symbol.clone(),
-                PriceTick {
-                    price: Self::decode_fixed_point(raw, decimals),
-                    source: self.name().to_string(),
-                    observed_at: now,
-                },
-            );
-        }
-        Ok(ticks)
-    }
-
-    fn name(&self) -> &str {
-        "reflector"
-    }
-}
-
-/// Configuration for the multi-source aggregator. All three knobs are
-/// operator-tunable so a deployment can trade off liveness against safety.
-#[derive(Debug, Clone)]
-pub struct AggregatorConfig {
-    /// Minimum number of fresh, non-outlier quotes required to publish a
-    /// reference price (quorum).
-    pub min_sources: usize,
-    /// Quotes older than this (relative to the newest observed quote) are
-    /// rejected as stale.
-    pub max_staleness_secs: i64,
-    /// Quotes deviating more than this many basis points from the median
-    /// are rejected as outliers.
-    pub max_deviation_bps: f64,
-}
-
-impl Default for AggregatorConfig {
-    fn default() -> Self {
-        Self {
-            min_sources: 2,
-            max_staleness_secs: 30,
-            max_deviation_bps: 500.0,
+/// Extract the client IP, honouring trusted-proxy forwarding headers when the
+/// peer is a trusted proxy. Falls back to the socket peer addr
         }
     }
 }
 
-/// Why a particular source's quote was excluded from the aggregate.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RejectReason {
-    /// The source did not return a quote for this underlying.
-    Missing,
-    /// The quote was older than `max_staleness_secs`.
-    Stale,
-    /// The quote deviated more than `max_deviation_bps` from the median.
-    Outlier,
+/// Build the JSON error body used for rejected upgrades, matching the shape
+/// used elsewhere in the API.
+fn rejection_response(status: StatusCode, message: &str) -> Response {
+    let body = serde_json::json!({ "error": message }).to_string();
+    (status, [("content-type", "application/json")], body).into_response()
 }
 
-impl std::fmt::Display for RejectReason {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RejectReason::Missing => write!(f, "missing"),
-            RejectReason::Stale => write!(f, "stale"),
-            RejectReason::Outlier => write!(f, "outlier"),
+/// Extract the client IP, honouring trusted-proxy forwarding headers when the
+/// peer is a trusted proxy. Falls back to the socket peer address.
+fn client_ip(state: &AppState, addr: &SocketAddr, headers: &axum::http::HeaderMap) -> String {
+    crate::rate_limit_key::extract_ip(state, addr, headers)
+}
+
+pub async fn ws_spot(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let ip = client_ip(&state, &addr, &headers);
+    let guard = match ConnectionGuard::acquire(&state, ip) {
+        Some(g) => g,
+        None => {
+            state.ws_disconnects_total.with_label_values(&["rejected"]).inc();
+            return rejection_response(StatusCode::TOO_MANY_REQUESTS, "connection limit reached");
         }
-    }
-}
-
-/// Health of an aggregated price, surfaced on read-only endpoints.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PriceStatus {
-    /// Quorum met and all contributing quotes are fresh.
-    Ok,
-    /// Quorum met but some sources were rejected (stale/outlier/missing).
-    Degraded,
-    /// No quorum, or the aggregate is older than `max_staleness_secs`.
-    Stale,
-}
-
-impl PriceStatus {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            PriceStatus::Ok => "ok",
-            PriceStatus::Degraded => "degraded",
-            PriceStatus::Stale => "stale",
-        }
-    }
-}
-
-/// The robust reference price for one underlying, plus the provenance
-/// needed to explain how it was derived.
-#[derive(Debug, Clone)]
-pub struct AggregatedPrice {
-    pub value: f64,
-    pub status: PriceStatus,
-    /// Sources whose quotes were included in the median.
-    pub contributors: Vec<String>,
-    /// Sources that were excluded, with the reason for each.
-    pub rejected: Vec<(String, RejectReason)>,
-    /// Timestamp of the newest contributing quote.
-    pub as_of: chrono::DateTime<chrono::Utc>,
-}
-
-impl AggregatedPrice {
-    /// A price is tradeable only when quorum was met and it is not stale.
-    pub fn is_tradeable(&self) -> bool {
-        self.status != PriceStatus::Stale
-    }
-
-    /// Human-readable reason used in the `503` error body.
-    pub fn unavailable_reason(&self) -> String {
-        if self.status == PriceStatus::Stale {
-            "no quorum or stale".to_string()
-        } else {
-            "ok".to_string()
-        }
-    }
-}
-
-/// Compute the median of a slice of prices. For an even number of values we
-/// take the mean of the two middle values (the standard statistical median),
-/// which is documented here so callers know the exact tie-breaking rule.
-pub fn median(prices: &mut [f64]) -> Option<f64> {
-    if prices.is_empty() {
-        return None;
-    }
-    prices.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let n = prices.len();
-    if n % 2 == 1 {
-        Some(prices[n / 2])
-    } else {
-        Some((prices[n / 2 - 1] + prices[n / 2]) / 2.0)
-    }
-}
-
-/// Aggregate a set of per-source quotes for a single underlying into a
-/// robust reference price.
-///
-/// Algorithm:
-/// 1. Drop quotes older than `max_staleness_secs` relative to the newest
-///    observed quote (clock skew between sources is tolerated by using the
-///    newest quote as the reference clock).
-/// 2. Compute the median of the remaining quotes.
-/// 3. Reject quotes deviating more than `max_deviation_bps` from the median.
-/// 4. Recompute the median over the survivors and require `min_sources`.
-pub fn aggregate(
-    quotes: &[(String, PriceTick)],
-    cfg: &AggregatorConfig,
-) -> AggregatedPrice {
-    let mut rejected: Vec<(String, RejectReason)> = Vec::new();
-
-    // Reference clock: the newest observed quote across all sources.
-    let newest = quotes
-        .iter()
-        .map(|(_, t)| t.observed_at)
-        .max()
-        .unwrap_or_else(chrono::Utc::now);
-
-    let mut fresh: Vec<(String, f64)> = Vec::new();
-    for (source, tick) in quotes {
-        let age = (newest - tick.observed_at).num_seconds();
-        if age > cfg.max_staleness_secs {
-            rejected.push((source.clone(), RejectReason::Stale));
-        } else {
-            fresh.push((source.clone(), tick.price));
-        }
-    }
-
-    if fresh.is_empty() {
-        return AggregatedPrice {
-            value: 0.0,
-            status: PriceStatus::Stale,
-            contributors: Vec::new(),
-            rejected,
-            as_of: newest,
-        };
-    }
-
-    let mut values: Vec<f64> = fresh.iter().map(|(_, p)| *p).collect();
-    let med = median(&mut values).unwrap_or(0.0);
-
-    // Outlier rejection against the median.
-    let mut survivors: Vec<(String, f64)> = Vec::new();
-    for (source, price) in fresh {
-        let deviation_bps = if med.abs() > f64::EPSILON {
-            ((price - med).abs() / med) * 10_000.0
-        } else {
-            0.0
-        };
-        if deviation_bps > cfg.max_deviation_bps {
-            rejected.push((source, RejectReason::Outlier));
-        } else {
-            survivors.push((source, price));
-        }
-    }
-
-    let mut survivor_values: Vec<f64> = survivors.iter().map(|(_, p)| *p).collect();
-    let value = median(&mut survivor_values).unwrap_or(med);
-
-    let status = if survivors.len() < cfg.min_sources {
-        PriceStatus::Stale
-    } else if rejected.is_empty() {
-        PriceStatus::Ok
-    } else {
-        PriceStatus::Degraded
     };
-
-    AggregatedPrice {
-        value,
-        status,
-        contributors: survivors.into_iter().map(|(s, _)| s).collect(),
-        rejected,
-        as_of: newest,
-    }
+    ws.on_upgrade(move |socket| handle_spot_socket(socket, state, guard))
 }
 
-/// Circuit breaker state for one underlying. Trips when the aggregate moves
-/// more than `threshold_bps` within a single tick and stays open until an
-/// operator resets it or the cool-down elapses.
-#[derive(Debug, Clone)]
-pub struct CircuitBreaker {
-    pub tripped: bool,
-    pub tripped_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub last_value: Option<f64>,
-    pub threshold_bps: f64,
-    pub cooldown_secs: i64,
-}
-
-impl CircuitBreaker {
-    pub fn new(threshold_bps: f64, cooldown_secs: i64) -> Self {
-        Self {
-            tripped: false,
-            tripped_at: None,
-            last_value: None,
-            threshold_bps,
-            cooldown_secs,
-        }
+async fn handle_spot_socket(mut socket: WebSocket, state: AppState, _guard: ConnectionGuard) {
+    // Send an immediate snapshot so the client has something to render
+    // before the first simulator tick (up to 2s away) arrives.
+    let snapshot = {
+        let prices = state.spot_prices.lock().unwrap().clone();
+        let vols = state.vol_surface.lock().unwrap().clone();
+        serde_json::json!({ "prices": prices, "vols": vols }).to_string()
+    };
+    if socket.send(Message::Text(snapshot)).await.is_err() {
+        state.ws_disconnects_total.with_label_values(&["send_error"]).inc();
+        return;
     }
+    state.ws_messages_sent_total.inc();
 
-    /// Feed a new aggregate value. Returns `true` if the breaker is (or
-    /// becomes) tripped and trading must halt.
-    pub fn observe(&mut self, value: f64, now: chrono::DateTime<chrono::Utc>) -> bool {
-        if self.tripped {
-            if let Some(at) = self.tripped_at {
-                if (now - at).num_seconds() >= self.cooldown_secs {
-                    self.reset();
+    let mut rx = state.spot_tx.subscribe();
+    let mut ping_interval = tokio::time::interval(PING_INTERVAL);
+    ping_interval.tick().await; // consume the immediate first tick
+    let mut awaiting_pong: Option<Instant> = None;
+    let mut lag_since: Option<Instant> = None;
+
+    loop {
+        tokio::select! {
+            update = rx.recv() => {
+                match update {
+                    Ok(payload) => {
+                      
+    }
+    state.ws_messages_sent_total.inc();
+
+    let mut rx = state.spot_tx.subscribe();
+    let mut ping_interval = tokio::time::interval(PING_INTERVAL);
+    ping_interval.tick().await; // consume the immediate first tick
+    let mut awaiting_pong: Option<Instant> = None;
+    let mut lag_since: Option<Instant> = None;
+
+    loop {
+        tokio::select! {
+            update = rx.recv() => {
+                match update {
+                    Ok(payload) => {
+                        lag_since = None;
+                        if socket.send(Message::Text(payload)).await.is_err() {
+                            state.ws_disconnects_total.with_label_values(&["send_error"]).inc();
+                            break;
+                        }
+                        state.ws_messages_sent_total.inc();
+                    }
+                    // Client fell behind the broadcast buffer — send a fresh
+                    // snapshot plus a resync notice instead of dropping ticks.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        state.ws_lagged_total.inc();
+                        let now = Instant::now();
+                        let since = *lag_since.get_or_insert(now);
+                        if now.duration_since(since) > MAX_LAG_DURATION {
+                            let _ = socket
+                                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                                    code: CLOSE_POLICY_VIOLATION,
+                                    reason: "slow consumer".into(),
+                                })))
+                                .await;
+                            state.ws_disconnects_total.with_label_values(&["slow_consumer"]).inc();
+                            break;
+                        }
+                        let snapshot = {
+                            let prices = state.spot_prices.lock().unwrap().clone();
+                            let vols = state.vol_surface.lock().unwrap().clone();
+                            serde_json::json!({ "prices": prices, "vols": vols }).to_string()
+                        };
+                        if socket.send(Message::Text(snapshot)).await.is_err() {
+                            state.ws_disconnects_total.with_label_values(&["send_error"]).inc();
+                            break;
+                        }
+                        state.ws_messages_sent_total.inc();
+                        let notice = serde_json::json!({ "type": "resync", "skipped": n }).to_string();
+                        if socket.send(Message::Text(notice)).await.is_err() {
+                            state.ws_disconnects_total.with_label_values(&["send_error"]).inc();
+                            break;
+                        }
+                        state.ws_messages_sent_total.inc();
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            _ = ping_interval.tick() => {
+                if let Some(sent) = awaiting_pong {
+                    if sent.elapsed() > PONG_TIMEOUT {
+                        let _ = socket
+                            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                                code: CLOSE_GOING_AWAY,
+                                reason: "pong timeout".into(),
+                            })))
+                            .await;
+                        state.ws_disconnects_total.with_label_values(&["pong_timeout"]).inc();
+                        break;
+                    }
+                }
+                if socket.send(Message::Ping(Vec::new())).await.is_err() {
+                    state.ws_disconnects_total.with_label_values(&["send_error"]).inc();
+                    break;
+                }
+                awaiting_pong = Some(Instant::now());
+            }
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Pong(_))) => {
+                        awaiting_pong = None;
+                    }
+                    Some(Err(_)) => break,
+                    _ => {} // ignore anything else the client sends; read-only feed
                 }
             }
         }
-        if let Some(prev) = self.last_value {
-            if prev.abs() > f64::EPSILON {
-                let move_bps = ((value - prev).abs() / prev) * 10_000.0;
-                if move_bps > self.threshold_bps {
-                    self.tripped = true;
-                    self.tripped_at = Some(now);
+    }
+    state.ws_messages_sent_total.inc();
+
                 }
             }
         }
@@ -696,38 +457,98 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
             break;
         }
     }
+    state.ws_disconnects_total.with_label_values(&["closed"]).inc();
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Multiplexed v2 WebSocket endpoint. One connection can subscribe to any
+/// number of public channels (`spot.<U>`, `chain.<U>.<EXPIRY>`,
+/// `surface.<U>`) and receives snapshot-then-delta messages with per-channel
+/// sequence numbers. The legacy `/api/v1/ws/spot` endpoint above is
+/// unchanged and still supported.
+pub async fn ws_v2(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let ip = client_ip(&state, &addr, &headers);
+    let guard = match ConnectionGuard::acquire(&state, ip) {
+        Some(g) => g,
+        None => {
+            state.ws_disconnects_total.with_label_values(&["rejected"]).inc();
+            return rejection_response(StatusCode::TOO_MANY_REQUESTS, "connection limit reached");
+        }
+    };
+    ws.on_upgrade(move |socket| handle_v2_socket(socket, state, guard))
+}
 
-    async fn test_state() -> (AppState, std::path::PathBuf) {
-        let db_path =
-            std::env::temp_dir().join(format!("zenith-prices-test-{}.db", uuid::Uuid::new_v4()));
-        let pool = crate::db::init_pool(&format!("sqlite://{}", db_path.display())).await;
-        (AppState::new(pool), db_path)
+/// A single channel's fan-out state: a broadcast sender plus a reference
+/// count of live subscribers. The count lets the hub lazily compute chain
+/// updates only while at least one client is listening.
+struct ChannelState {
+    tx: broadcast::Sender<String>,
+    subscribers: usize,
+}
+
+/// Central hub holding one broadcast channel per subscribed channel name.
+/// Shared across all v2 connections via `Arc<Mutex<..>>`.
+#[derive(Default)]
+struct Hub {
+    channels: HashMap<String, ChannelState>,
+}
+
+impl Hub {
+    /// Subscribe to `channel`, creating the broadcast sender on first use.
+    /// Returns the receiver and the current sequence number to stamp on the
+    /// snapshot the caller is about to send.
+    fn subscribe(&mut self, channel: &str) -> broadcast::Receiver<String> {
+        let entry = self.channels.entry(channel.to_string()).or_insert_with(|| {
+            let (tx, _) = broadcast::channel(64);
+            ChannelState { tx, subscribers: 0 }
+        });
+        entry.subscribers += 1;
+        entry.tx.subscribe()
     }
 
-    #[tokio::test]
-    async fn tick_once_moves_every_price_within_the_per_tick_bound() {
-        let (state, db_path) = test_state().await;
-        let before = state.market.load().spot.clone();
-
-        tick_once(&state);
-
-        let after = state.market.load().spot.clone();
-        for (underlying, before_price) in &before {
-            let after_price = after[underlying];
-            let max_move = before_price * MAX_PCT_MOVE_PER_TICK;
-            assert!(
-                (after_price - before_price).abs() <= max_move + 1e-9,
-                "{underlying} moved from {before_price} to {after_price}, beyond the {MAX_PCT_MOVE_PER_TICK} bound"
-            );
+    /// Drop one subscriber from `channel`, removing the channel entirely
+    /// once nobody is left so its broadcast buffer is freed.
+    fn unsubscribe(&mut self, channel: &str) {
+        if let Some(entry) = self.channels.get_mut(channel) {
+            entry.subscribers = entry.subscribers.saturating_sub(1);
+            if entry.subscribers == 0 {
+                self.channels.remove(channel);
+            }
         }
+    }
 
-        state.db.close().await;
-        let _ = std::fs::remove_file(&db_path);
+    /// True when at least one client is subscribed to `channel`. Used to
+    /// skip computing chain/surface updates nobody is listening for.
+    fn has_subscribers(&self, channel: &str) -> bool {
+        self.channels.get(channel).map(|c| c.subscribers > 0).unwrap_or(false)
+    }
+
+    /// Publish a payload on `channel` if it exists. Returns whether the
+    /// channel had any subscribers (i.e. whether the work was worth doing).
+    fn publish(&self, channel: &st
+        }
+    }
+
+    /// True when at least one client is subscribed to `channel`. Used to
+    /// skip computing chain/surface updates nobody is listening for.
+    fn has_subscribers(&self, channel: &str) -> bool {
+        self.channels.get(channel).map(|c| c.subscribers > 0).unwrap_or(false)
+    }
+
+    /// Publish a payload on `channel` if it exists. Returns whether the
+    /// channel had any subscribers (i.e. whether the work was worth doing).
+    fn publish(&self, channel: &str, payload: String) -> bool {
+        match self.channels.get(channel) {
+            Some(entry) if entry.subscribers > 0 => {
+                let _ = entry.tx.send(payload);
+                true
+            }
+            _ => false,
+        }
     }
 
     #[tokio::test]
@@ -772,9 +593,160 @@ mod tests {
                 "{underlying}: broadcast {broadcast_price} vs live {live_price}"
             );
         }
+    }
 
-        state.db.close().await;
-        let _ = std::fs::remove_file(&db_path);
+    #[tokio::test]
+    async fn tick_once_bounds_price_movement_per_tick() {
+        let (state, db_path) = test_state().await;
+        let before = state.market.load().spot.clone();
+
+        tick_once(&state);
+
+        let after = state.market.load().spot.clone();
+        for (underlying, before_price) in &before {
+            let after_price = after[underlying];
+            let max_move = before_price * MAX_PCT_MOVE_PER_TICK;
+            assert!(
+                (after_price - before_price).abs() <= max_move + 1e-9,
+                "{underlying} moved from {before_price} to {after_price}, beyond the {MAX_PCT_MOVE_PER_TICK} bound"
+            );
+        }
+    }
+
+        }
+    }
+}
+
+/// Per-connection subscription bookkeeping: the channel name, its receiver,
+/// and the last sequence number sent on it.
+struct Subscription {
+    channel: String,
+    rx: broadcast::Receiver<String>,
+    seq: u64,
+}
+
+/// Validate a channel name against the supported public channel grammar.
+/// Returns `Ok(())` for a well-formed channel, or `Err(reason)` describing
+/// why it was rejected. Unknown underlyings are rejected here too so the
+/// client gets a structured error instead of a silent no-op.
+fn validate_channel(state: &AppState, channel: &str) -> Result<(), String> {
+    let parts: Vec<&str> = channel.split('.').collect();
+    match parts.as_slice() {
+        ["spot", underlying] => {
+            if state.spot_prices.lock().unwrap().contains_key(*underlying) {
+                Ok(())
+            } else {
+                Err(format!("unknown underlying: {underlying}"))
+            }
+        }
+        ["surface", underlying] => {
+            if state.vol_surface.lock().unwrap().contains_key(*underlying) {
+                Ok(())
+            } else {
+                Err(format!("unknown underlying: {underlying}"))
+            }
+        }
+        ["chain", underlying, expiry] => {
+            if !state.spot_prices.lock().unwrap().contains_key(*underlying) {
+                return Err(format!("unknown underlying: {underlying}"));
+            }
+            if expiry.is_empty() {
+                return Err("missing expiry".to_string());
+            }
+            Ok(())
+        }
+        _ => Err(format!("unknown channel: {channel}")),
+    }
+}
+
+/// Handle a v2 connection: read subscribe/unsubscribe frames, fan out
+/// per-channel messages, and reap the connection on idle timeout.
+async fn handle_v2_socket(mut socket: WebSocket, state: AppState, _guard: ConnectionGuard) {
+    let hub = state.ws_hub.clone();
+    let mut subs: HashMap<String, Subscription> = HashMap::new();
+    let mut ping_interval = tokio::time::interval(PING_INTERVAL);
+    ping_interval.tick().await;
+    let mut awaiting_pong: Option<Instant> = None;
+    let idle = tokio::time::sleep(IDLE_TIMEOUT);
+    tokio::pin!(idle);
+
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(Message::Text(text))) => {
+                        let msg: serde_json::Value = match serde_json::from_str(&text) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                        let action = msg.get("action").and_then(|v| v.as_str()).unwrap_or("");
+                        let channel = msg.get("channel").and_then(|v| v.as_str()).unwrap_or("");
+                        match action {
+                            "subscribe" => {
+                                if subs.len() >= MAX_SUBSCRIPTIONS_PER_CONNECTION {
+                                    continue;
+                                }
+                                if validate_channel(&state, channel).is_err() {
+                                    continue;
+                                }
+                                let mut hub = hub.lock().await;
+                                let rx = hub.subscribe(channel);
+                                drop(hub);
+                                subs.insert(
+                                    channel.to_string(),
+                                    Subscription { channel: channel.to_string(), rx, seq: 0 },
+                                );
+                            }
+                            "unsubscribe" => {
+                                if subs.remove(channel).is_some() {
+                                    hub.lock().await.unsubscribe(channel);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Some(Ok(Message::Pong(_))) => {
+                        awaiting_pong = None;
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(_)) => break,
+                    _ => {}
+                }
+            }
+            _ = ping_interval.tick() => {
+                if let Some(sent) = awaiting_pong {
+                    if sent.elapsed() > PONG_TIMEOUT {
+                        let _ = socket
+                            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                                code: CLOSE_GOING_AWAY,
+                                reason: "pong timeout".into(),
+                            })))
+                            .await;
+                        state.ws_disconnects_total.with_label_values(&["pong_timeout"]).inc();
+                        break;
+                    }
+                }
+                if socket.send(Message::Ping(Vec::new())).await.is_err() {
+                    break;
+                }
+                awaiting_pong = Some(Instant::now());
+            }
+            _ = &mut idle => {
+                let _ = socket
+                    .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                        code: CLOSE_GOING_AWAY,
+                        reason: "idle timeout".into(),
+                    })))
+                    .await;
+                state.ws_disconnects_total.with_label_values(&["idle_timeout"]).inc();
+                break;
+            }
+        }
+    }
+
+    let mut hub = hub.lock().await;
+    for (channel, _) in subs.drain() {
+        hub.unsubscribe(&channel);
     }
 
     /// Hammers reads while the writer publishes new snapshots and asserts
