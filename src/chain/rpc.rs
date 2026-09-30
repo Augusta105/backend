@@ -56,7 +56,6 @@ impl SorobanRpcClient {
         Ok(result)
     }
 }
-
 impl RpcClient {
     /// Create a client for the given RPC endpoint URL.
     pub fn new(endpoint: impl Into<String>) -> Self {
@@ -401,5 +400,4 @@ mod tests {
         assert_eq!(err.message, "HostError: Error(WasmVm, MissingValue)");
     }
 }
-    }
-}
+
