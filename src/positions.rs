@@ -14,6 +14,60 @@ use crate::margin::{MarginModel, RiskArrayMargin, StrategyBasedMargin};
 use crate::models::{Account, Position};
 use crate::{black_scholes, smile_vol, AppState, BSInputs, BSResult};
 
+/// Seconds in a (Julian) year, used to convert an absolute time-to-expiry
+/// into the `t` Black-Scholes expects.
+const SECONDS_PER_YEAR: f64 = 365.0 * 24.0 * 60.0 * 60.0;
+
+/// Derives the Black-Scholes time-to-expiry `t` (in years) from a position's
+/// absolute `expires_at` and the current time. Clamped at zero so a position
+/// held past expiry reprices at intrinsic value instead of producing a
+/// negative `t` (which would yield NaN in Black-Scholes).
+pub(crate) fn time_to_expiry_years(expires_at: &str, now_unix: i64) -> f64 {
+    let expiry_unix = parse_iso8601_utc(expires_at).unwrap_or(now_unix);
+    let remaining = (expiry_unix - now_unix).max(0) as f64;
+    remaining / SECONDS_PER_YEAR
+}
+
+/// Minimal ISO-8601 UTC parser (`YYYY-MM-DDTHH:MM:SSZ`), returning Unix
+/// seconds. Kept local so this module doesn't pull in a new dependency; the
+/// migration writes exactly this format.
+fn parse_iso8601_utc(s: &str) -> Option<i64> {
+    let s = s.trim_end_matches('Z');
+    let (date, time) = s.split_once('T')?;
+    let mut d = date.split('-');
+    let year: i64 = d.next()?.parse().ok()?;
+    let month: i64 = d.next()?.parse().ok()?;
+    let day: i64 = d.next()?.parse().ok()?;
+    let mut t = time.split(':');
+    let hour: i64 = t.next()?.parse().ok()?;
+    let minute: i64 = t.next()?.parse().ok()?;
+    let second: i64 = t.next().unwrap_or("0").parse().ok()?;
+    Some(days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second)
+}
+
+/// Days since the Unix epoch for a proleptic Gregorian date (Howard Hinnant's
+/// `days_from_civil` algorithm).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Intrinsic value of an option at settlement: the payoff a holder would
+/// realise if exercised immediately at the fixing price. Calls are worth
+/// `max(spot - strike, 0)`, puts `max(strike - spot, 0)`. Shared with the
+/// settlement engine so manual closes and automated expiry agree exactly.
+pub(crate) fn intrinsic_value(option_type: &str, strike: f64, spot: f64) -> f64 {
+    if option_type == "call" {
+        (spot - strike).max(0.0)
+    } else {
+        (strike - spot).max(0.0)
+    }
+}
+
 /// Selects the margin model for the current environment. `RiskArrayMargin`
 /// (the SPAN-style stress grid) is the default; `StrategyBasedMargin` keeps
 /// the legacy per-leg rules available as a fallback via the
@@ -74,7 +128,6 @@ pub(crate) async fn ensure_current_epoch(
         .map_err(|e| db_error("set current epoch", e))?;
 
     Ok(epoch_id)
-}
 }
 
 pub async fn get_account(
@@ -420,24 +473,44 @@ pub(crate) async fn open_position_in_tx(
         (spot, vol)
     };
 
-    let vol = smile_vol(base_vol, req.strike / spot);
-    let t = req.expiry_days / 365.0;
-    let is_call = req.option_type == "call";
-    let entry_premium = black_scholes(&BSInputs {
+    // Snap the requested `expiry_days` to the nearest listed expiry from the
+    // expiry calendar so every position carries a real, tradeable expiry.
+    // Documented behaviour: we snap (rather than reject) to keep the existing
+    // `expiry_days` API working while positions gain absolute `expires_at`.
+    let expires_at = crate::expiry::snap_expiry(&state, &req.underlying, req.expiry_days)
+        .ok_or_else(|| {
+            AppError::new(
+                StatusCode::NOT_FOUND,
+                format!("no listed expiry for \"{}\"", req.underlying),
+            )
+        })?;
+
+    let t = time_to_expiry_years(&expires_at, crate::now_unix());
+    let sigma = smile_vol(base_vol, req.strike, spot, t);
+    let bs = black_scholes(BSInputs {
         spot,
         strike: req.strike,
-        vol,
         t,
-        r: 0.05,
-        is_call,
-    })
-    .premium;
+        vol: sigma,
+        option_type: req.option_type.clone(),
+    });
 
     let is_short = req.position_type == "short";
-    let cash_delta = if is_short {
-        entry_premium * req.contracts // premium received
+    let notional = entry_premium * req.contracts;
+    let collateral = collateral_required(
+        &req.position_type,
+        &req.option_type,
+        spot,
+        req.strike,
+        req.contracts,
+    );
+
+    // Long positions pay the premium up front; short positions receive it
+    // but must lock collateral. Both effects land on the same balance.
+    let balance_delta = if is_short {
+        notional - collateral
     } else {
-        -entry_premium * req.contracts // premium paid
+        -notional
     };
 
     // Serialise on the account row so a reset can't interleave with an
@@ -447,7 +520,7 @@ pub(crate) async fn open_position_in_tx(
         .bind(wallet_address)
         .fetch_one(&mut **tx)
         .await
-        .map_err(|e| db_error("load account", e))?;
+        .map_err(|e| db_error("load account for open", e))?;
 
     let epoch_id = ensure_current_epoch(tx, wallet_address).await?;
 
@@ -484,31 +557,38 @@ pub(crate) async fn open_position_in_tx(
             "insufficient buying power: post-trade initial margin would exceed equity",
         ));
     }
+        ));
+    }
 
-    sqlx::query("UPDATE accounts SET balance = ?, collateral_locked = ? WHERE wallet_address = ?")
-        .bind(new_balance)
-        .bind(new_collateral_locked)
-        .bind(wallet_address)
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| db_error("update account balance", e))?;
-
-    let id = uuid::Uuid::new_v4().to_string();
     sqlx::query(
-        "INSERT INTO positions
-            (id, wallet_address, underlying, strike, expiry_days, option_type,
-             position_type, contracts, entry_premium, entry_spot, collateral, status, strategy_id, epoch_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)",
+        "UPDATE accounts
+            SET balance = balance + ?,
+                locked_collateral = locked_collateral + ?
+          WHERE wallet_address = ?",
     )
-    .bind(&id)
+    .bind(balance_delta)
+    .bind(collateral)
+    .bind(wallet_address)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| db_error("update account for open", e))?;
+
+    let position: Position = sqlx::query_as(
+        "INSERT INTO positions
+            (id, wallet_address, underlying, strike, expiry_days, expires_at, option_type,
+             position_type, contracts, entry_premium, entry_spot, collateral, status, strategy_id, epoch_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)
+         RETURNING *",
+    )
     .bind(wallet_address)
     .bind(&req.underlying)
     .bind(req.strike)
     .bind(req.expiry_days)
+    .bind(&expires_at)
     .bind(&req.option_type)
     .bind(&req.position_type)
     .bind(req.contracts)
-    .bind(entry_premium)
+    .bind(premium)
     .bind(spot)
     .bind(requirement.contribution_for(&id))
     .bind(strategy_id)
@@ -524,6 +604,89 @@ pub(crate) async fn open_position_in_tx(
         .map_err(|e| db_error("load position", e))?;
 
     Ok(position)
+}
+
+/// Settles a single position at expiry inside the caller's transaction.
+///
+/// This is the shared settlement math used by both the manual close handler
+/// and the automated expiry engine: the position is marked `expired`, its
+/// `close_premium` is the intrinsic value at the fixing price, `close_spot`
+/// is the fixing itself, and `realized_pnl` is the net cash effect for the
+/// holder. Collateral is released back to the account.
+///
+/// Returns the realised P&L so callers (e.g. the settlement engine) can
+/// aggregate it. Idempotency is the caller's responsibility: only rows still
+/// in `status = 'open'` should be passed in, and the `WHERE status = 'open'`
+/// guard below makes a double-settle a no-op that returns `None`.
+pub(crate) async fn settle_position_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    position_id: i64,
+    fixing: f64,
+) -> Result<Option<f64>, AppError> {
+    let position: Position = sqlx::query_as("SELECT * FROM positions WHERE id = ?")
+        .bind(position_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(|e| db_error("load position for settlement", e))?;
+
+    // Guard against double-settlement: if the row already left `open`
+    // (manual close, prior settlement run, roll), do nothing.
+    if position.status != "open" {
+        return Ok(None);
+    }
+
+    let intrinsic = intrinsic_value(&position.option_type, position.strike, fixing);
+    let notional = intrinsic * position.contracts;
+
+    // Long: the holder receives intrinsic value (premium was paid at open).
+    // Short: the writer pays intrinsic value out of the locked collateral;
+    // if collateral is short of the liability we settle what is available
+    // and leave the account balance at zero rather than going negative.
+    let (balance_delta, collateral_release) = if position.position_type == "long" {
+        (notional, position.collateral)
+    } else {
+        let liability = notional.min(position.collateral);
+        (-liability, position.collateral)
+    };
+
+    let realized_pnl = if position.position_type == "long" {
+        notional - position.open_premium * position.contracts
+    } else {
+        position.open_premium * position.contracts - notional
+    };
+
+    sqlx::query(
+        "UPDATE accounts
+            SET balance = balance + ?,
+                locked_collateral = locked_collateral - ?
+          WHERE wallet_address = ?",
+    )
+    .bind(balance_delta)
+    .bind(collateral_release)
+    .bind(&position.wallet_address)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| db_error("release collateral on settlement", e))?;
+
+    sqlx::query(
+        "UPDATE positions
+            SET status = 'expired',
+                close_premium = ?,
+                close_spot = ?,
+                realized_pnl = ?,
+                closed_at = ?
+          WHERE id = ? AND status = 'open'",
+    )
+    .bind(intrinsic)
+    .bind(fixing)
+    .bind(realized_pnl)
+    .bind(crate::now_unix())
+    .bind(position_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(|e| db_error("mark position expired", e))?;
+
+    Ok(Some(realized_pnl))
 }
 
 /// Closes an open position inside the caller's transaction, releasing its
