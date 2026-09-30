@@ -284,7 +284,10 @@ pub async fn close_strategy(
 
     let mut closed = Vec::with_capacity(open_leg_ids.len());
     for id in &open_leg_ids {
-        closed.push(close_position_in_tx(&mut tx, &state, &wallet_address, id).await?);
+        // Full close of each leg: contracts = None means "close the whole
+        // position", which is exactly the pre-partial-close behaviour.
+        let position = close_position_in_tx(&mut tx, &state, &wallet_address, id, None).await?;
+        closed.push(position);
     }
 
     tx.commit()
