@@ -10,8 +10,20 @@ use sqlx::{Sqlite, Transaction};
 use crate::auth::AuthUser;
 use crate::collateral::collateral_required;
 use crate::error::{db_error, AppError, AppJson, AppQuery};
+use crate::margin::{MarginModel, RiskArrayMargin, StrategyBasedMargin};
 use crate::models::{Account, Position};
 use crate::{black_scholes, smile_vol, AppState, BSInputs, BSResult};
+
+/// Selects the margin model for the current environment. `RiskArrayMargin`
+/// (the SPAN-style stress grid) is the default; `StrategyBasedMargin` keeps
+/// the legacy per-leg rules available as a fallback via the
+/// `MARGIN_MODEL=strategy_based` environment flag.
+pub(crate) fn margin_model() -> Box<dyn MarginModel> {
+    match std::env::var("MARGIN_MODEL").as_deref() {
+        Ok("strategy_based") => Box::new(StrategyBasedMargin),
+        _ => Box::new(RiskArrayMargin::default()),
+    }
+}
 
 /// Default starting balance for a fresh paper account / epoch.
 pub const DEFAULT_STARTING_BALANCE: f64 = 100_000.0;
@@ -62,6 +74,7 @@ pub(crate) async fn ensure_current_epoch(
         .map_err(|e| db_error("set current epoch", e))?;
 
     Ok(epoch_id)
+}
 }
 
 pub async fn get_account(
@@ -337,6 +350,32 @@ pub struct OpenPositionRequest {
     pub contracts: f64,
 }
 
+/// Loads the wallet's currently-open positions inside the caller's
+/// transaction. The margin engine works off this post-trade-visible set so
+/// the what-if check and the commit see exactly the same book.
+pub(crate) async fn load_open_positions_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    wallet_address: &str,
+) -> Result<Vec<Position>, AppError> {
+    sqlx::query_as(
+        "SELECT * FROM positions WHERE wallet_address = ? AND status = 'open'",
+    )
+    .bind(wallet_address)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(|e| db_error("load open positions", e))
+}
+
+/// Computes the portfolio margin requirement for a wallet's post-trade
+/// position set using the environment-selected model. Returns the initial
+/// requirement, the maintenance requirement, the worst stress scenario and
+/// the per-position contribution breakdown.
+pub(crate) fn portfolio_requirement(
+    positions: &[Position],
+) -> crate::margin::MarginRequirement {
+    margin_model().requirement(positions)
+}
+
 /// Prices and inserts a new position, debiting/crediting the account and
 /// locking collateral as needed, all within the caller's transaction.
 /// Shared by the open handler and (once it exists) the roll handler, so
@@ -395,11 +434,6 @@ pub(crate) async fn open_position_in_tx(
     .premium;
 
     let is_short = req.position_type == "short";
-    let collateral = if is_short {
-        collateral_required(&req.option_type, req.contracts, req.strike, spot)
-    } else {
-        0.0
-    };
     let cash_delta = if is_short {
         entry_premium * req.contracts // premium received
     } else {
@@ -417,15 +451,37 @@ pub(crate) async fn open_position_in_tx(
 
     let epoch_id = ensure_current_epoch(tx, wallet_address).await?;
 
+    // Build the post-trade position set (existing open legs plus the leg
+    // about to be inserted) and run the portfolio margin engine over it.
+    // This is the what-if: it happens before any write, inside the same
+    // transaction, so a concurrent open cannot slip past the check.
+    let mut post_trade = load_open_positions_in_tx(tx, wallet_address).await?;
+    post_trade.push(Position {
+        id: String::new(),
+        wallet_address: wallet_address.to_string(),
+        underlying: req.underlying.clone(),
+        strike: req.strike,
+        expiry_days: req.expiry_days,
+        option_type: req.option_type.clone(),
+        position_type: req.position_type.clone(),
+        contracts: req.contracts,
+        entry_premium,
+        entry_spot: spot,
+        collateral: 0.0,
+        status: "open".to_string(),
+        strategy_id: strategy_id.map(|s| s.to_string()),
+    });
+
+    let requirement = portfolio_requirement(&post_trade);
     let new_balance = account.balance + cash_delta;
-    let new_collateral_locked = account.collateral_locked + collateral;
-    // Available buying power must stay non-negative: cash on hand minus
-    // whatever's locked as collateral (across all positions, not just
-    // this one) must cover this trade's premium debit/collateral.
+    let new_collateral_locked = requirement.initial;
+
+    // A trade is rejected with 422 if the post-trade initial margin would
+    // exceed equity (balance minus the portfolio requirement).
     if new_balance - new_collateral_locked < 0.0 {
         return Err(AppError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
-            "insufficient buying power: this trade's premium/collateral would exceed balance minus locked collateral",
+            "insufficient buying power: post-trade initial margin would exceed equity",
         ));
     }
 
@@ -454,7 +510,7 @@ pub(crate) async fn open_position_in_tx(
     .bind(req.contracts)
     .bind(entry_premium)
     .bind(spot)
-    .bind(collateral)
+    .bind(requirement.contribution_for(&id))
     .bind(strategy_id)
     .bind(epoch_id)
     .execute(&mut **tx)
@@ -469,3 +525,58 @@ pub(crate) async fn open_position_in_tx(
 
     Ok(position)
 }
+
+/// Closes an open position inside the caller's transaction, releasing its
+/// share of collateral and recomputing the wallet's portfolio requirement
+/// over the remaining book.
+pub(crate) async fn close_position_in_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    wallet_address: &str,
+    position_id: &str,
+) -> Result<Position, AppError> {
+    let position: Position = sqlx::query_as(
+        "SELECT * FROM positions WHERE id = ? AND wallet_address = ? AND status = 'open'",
+    )
+    .bind(position_id)
+    .bind(wallet_address)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|e| db_error("load position to close", e))?;
+
+    sqlx::query("UPDATE positions SET status = 'closed' WHERE id = ?")
+        .bind(position_id)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| db_error("close position", e))?;
+
+    let remaining = load_open_positions_in_tx(tx, wallet_address).await?;
+    let requirement = portfolio_requirement(&remaining);
+
+    sqlx::query("UPDATE accounts SET collateral_locked = ? WHERE wallet_address = ?")
+        .bind(requirement.initial)
+        .bind(wallet_address)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| db_error("update account collateral", e))?;
+
+    Ok(position)
+}
+
+/// `GET /api/v1/account/margin` — returns the initial requirement, the
+/// maintenance requirement, the worst stress scenario and a per-position
+/// contribution breakdown for the authenticated wallet.
+pub async fn get_margin(
+    State(state): State<AppState>,
+    AuthUser(wallet_address): AuthUser,
+) -> Result<Json<crate::margin::MarginRequirement>, AppError> {
+    let positions: Vec<Position> = sqlx::query_as(
+        "SELECT * FROM positions WHERE wallet_address = ? AND status = 'open'",
+    )
+    .bind(&wallet_address)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| db_error("load open positions", e))?;
+
+    Ok(Json(portfolio_requirement(&positions)))
+}
+
