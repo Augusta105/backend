@@ -1,3 +1,62 @@
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerEntryInfo {
+    pub key: String,
+    pub live_until_ledger_seq: Option<u32>, // None if archived
+    pub is_archived: bool,
+}
+
+#[derive(Clone)]
+pub struct SorobanRpcClient {
+    pub rpc_url: String,
+    mock_entries: Arc<Mutex<HashMap<String, LedgerEntryInfo>>>,
+}
+
+impl SorobanRpcClient {
+    pub fn new(rpc_url: String) -> Self {
+        Self {
+            rpc_url,
+            mock_entries: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub fn insert_mock_entry(&self, key: &str, live_until: Option<u32>, is_archived: bool) {
+        let mut entries = self.mock_entries.lock().unwrap();
+        entries.insert(
+            key.to_string(),
+            LedgerEntryInfo {
+                key: key.to_string(),
+                live_until_ledger_seq: live_until,
+                is_archived,
+            },
+        );
+    }
+
+    pub async fn get_latest_ledger(&self) -> Result<u32, String> {
+        Ok(1_000_000)
+    }
+
+    pub async fn get_ledger_entries(&self, keys: &[String]) -> Result<Vec<LedgerEntryInfo>, String> {
+        let entries = self.mock_entries.lock().unwrap();
+        let mut result = Vec::new();
+        for k in keys {
+            if let Some(entry) = entries.get(k) {
+                result.push(entry.clone());
+            } else {
+                result.push(LedgerEntryInfo {
+                    key: k.clone(),
+                    live_until_ledger_seq: Some(1_500_000),
+                    is_archived: false,
+                });
+            }
+        }
+        Ok(result)
+    }
+}
+
 impl RpcClient {
     /// Create a client for the given RPC endpoint URL.
     pub fn new(endpoint: impl Into<String>) -> Self {
@@ -257,39 +316,6 @@ impl RpcClient {
 
         body.result
             .ok_or_else(|| RpcError::Decode("missing result in json-rpc response".into()))
-    }
-}
-            .send()
-            .await
-            .map_err(|e| RpcError::Transport(e.to_string()))?;
-
-        let status = response.status();
-        if status.as_u16() == 429 {
-            return Err(RpcError::RateLimited(url.to_string()));
-        }
-        if !status.is_success() {
-            return Err(RpcError::Transport(format!("http {status}")));
-        }
-
-        let payload: Value = response
-            .json()
-            .await
-            .map_err(|e| RpcError::Transport(e.to_string()))?;
-
-        if let Some(error) = payload.get("error") {
-            let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
-            let message = error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown rpc error")
-                .to_string();
-            return Err(RpcError::Rpc { code, message });
-        }
-
-        payload
-            .get("result")
-            .cloned()
-            .ok_or_else(|| RpcError::Unexpected("missing result".into()))
     }
 
     /// Execute an idempotent read with retries and endpoint failover.
